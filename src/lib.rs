@@ -5,6 +5,8 @@ use flume::{Receiver, SendError, Sender, bounded};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub use flume;
+
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum Error<T> {
     /// This channel does not exist.
