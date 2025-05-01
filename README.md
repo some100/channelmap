@@ -1,6 +1,6 @@
 # ChannelMap
 
-A DashMap wrapper over asynchronous tokio channels. Provides a convenient way to send messages over named channels.
+A DashMap wrapper over asynchronous flume channels. Provides a convenient way to send messages over named channels.
 
 ## Example
 
@@ -14,16 +14,16 @@ async fn main() {
     let mut set = JoinSet::new();
 
     for i in 0..10 {
-        let mut rx = channels.add(&i.to_string());
+        let rx = channels.add(&i.to_string()).unwrap();
         set.spawn(async move {
-            let msg = rx.recv().await.unwrap();
+            let msg = rx.recv_async().await.unwrap();
             assert_eq!(msg, "bar");
             println!("Channel {i} got message {msg}");
         });
     }
 
     for tx in channels.iter() {
-        tx.send("bar").await.unwrap();
+        tx.send("bar").unwrap();
     }
     
     set.join_all().await;

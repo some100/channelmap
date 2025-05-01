@@ -1,51 +1,79 @@
-//! `ChannelMap` is a `DashMap` wrapper over Tokio asynchronous channels
+//! `ChannelMap` is a `DashMap` wrapper over flume asynchronous/synchronous channels
 
-use dashmap::DashMap;
-use flume::{Receiver, SendError, Sender, bounded};
+use dashmap::{
+    DashMap,
+    mapref::entry::Entry,
+};
+use flume::{bounded, Receiver, Sender, TrySendError};
 use std::sync::Arc;
 use thiserror::Error;
 
 pub use flume;
 
+#[non_exhaustive]
 #[derive(Error, Debug, PartialEq, Eq)]
-pub enum Error<T> {
+pub enum Error {
     /// This channel does not exist.
     #[error("Channel does not exist")]
     Nonexistent,
-    /// The message failed to be sent through the channel,
-    /// possibly due to the `Receiver` being dropped or
-    /// closed.
-    #[error("Send Error: {0}")]
-    Send(#[from] SendError<T>),
+    /// The channel is full.
+    #[error("Channel is full")]
+    Full,
+    /// The receiver disconnected from the channel.
+    #[error("Channel disconnected")]
+    Disconnected,
+    /// This channel already exists.
+    #[error("Channel already exists")]
+    AlreadyExists(String),
 }
 
 /// A concurrent map with asynchronous channels
 #[derive(Debug, Clone)]
 pub struct ChannelMap<T> {
     channels: Arc<DashMap<String, Sender<T>>>,
+    buffer: usize,
 }
 
 impl<T> ChannelMap<T> {
-    /// Creates a new [`ChannelMap`]
+    /// Creates a new [`ChannelMap`] with a default buffer size of 100
     #[must_use]
     pub fn new() -> Self {
+        Self::new_with_buffer(100)
+    }
+
+    /// Creates a new [`ChannelMap`] with the specified default buffer size
+    #[must_use]
+    pub fn new_with_buffer(buffer: usize) -> Self {
         Self {
             channels: Arc::new(DashMap::new()),
+            buffer,
         }
     }
 
-    /// Adds a channel to [`ChannelMap`] with a set buffer of 100
-    #[must_use]
-    pub fn add(&self, name: &str) -> Receiver<T> {
-        self.add_with_buffer(name, 100)
+    /// Adds a channel to [`ChannelMap`] with the default buffer size.
+    /// This will usually be set to 100 if the user doesn't specify.
+    ///
+    /// # Errors
+    ///
+    /// If the channel already exists inside [`ChannelMap`], this
+    /// function will return an error.
+    pub fn add(&self, name: &str) -> Result<Receiver<T>, Error> {
+        self.add_with_buffer(name, self.buffer)
     }
 
-    /// Adds a channel to [`ChannelMap`] with a specified buffer capacity
-    #[must_use]
-    pub fn add_with_buffer(&self, name: &str, buffer: usize) -> Receiver<T> {
+    /// Adds a channel to [`ChannelMap`] with a specified buffer
+    ///
+    /// # Errors
+    ///
+    /// If the channel already exists inside [`ChannelMap`], this
+    /// function will return an error.
+    pub fn add_with_buffer(&self, name: &str, buffer: usize) -> Result<Receiver<T>, Error> {
         let (sender, receiver) = bounded(buffer);
-        self.channels.insert(name.to_owned(), sender);
-        receiver
+        match self.channels.entry(name.to_owned()) {
+            Entry::Occupied(_) => return Err(Error::AlreadyExists(name.to_owned())),
+            Entry::Vacant(entry) => entry.insert(sender),
+        };
+        Ok(receiver)
     }
 
     /// Returns the total number of channels inside of [`ChannelMap`]
@@ -81,9 +109,11 @@ impl<T> ChannelMap<T> {
         self.channels.clear();
     }
 
-    /// Removes a channel from [`ChannelMap`] by its name
-    pub fn remove(&self, name: &str) {
-        self.channels.remove(name);
+    /// Returns `true` if the channel was removed from [`ChannelMap`], otherwise
+    /// `false`
+    #[allow(clippy::must_use_candidate)]
+    pub fn remove(&self, name: &str) -> bool {
+        self.channels.remove(name).is_some()
     }
 
     #[must_use]
@@ -97,9 +127,14 @@ impl<T> ChannelMap<T> {
     /// # Errors
     ///
     /// If there was an error sending a message in the channel,
-    /// this function will return an error.
-    pub fn send(&self, name: &str, msg: T) -> Result<(), Error<T>> {
-        self.get(name).ok_or(Error::Nonexistent)?.send(msg)?;
+    /// this method will remove the faulty channel and return
+    /// an error.
+    pub fn send(&self, name: &str, msg: T) -> Result<(), Error> {
+        let tx = self.get(name).ok_or(Error::Nonexistent)?;
+        if tx.send(msg).is_err() {
+            self.remove(name);
+            return Err(Error::Disconnected);
+        }
         Ok(())
     }
 
@@ -108,13 +143,34 @@ impl<T> ChannelMap<T> {
     /// # Errors
     ///
     /// If there was an error sending a message in the channel,
-    /// the function will return an error.
-    pub async fn send_async(&self, name: &str, msg: T) -> Result<(), Error<T>> {
-        self.get(name)
-            .ok_or(Error::Nonexistent)?
-            .send_async(msg)
-            .await?;
+    /// the method will remove the faulty channel and return
+    /// an error.
+    pub async fn send_async(&self, name: &str, msg: T) -> Result<(), Error> {
+        let tx = self.get(name).ok_or(Error::Nonexistent)?;
+        if tx.send_async(msg).await.is_err() {
+            self.remove(name);
+            return Err(Error::Disconnected);
+        }
         Ok(())
+    }
+
+    /// Convenience method allowing to send messages without awaiting
+    /// 
+    /// # Errors
+    /// 
+    /// If the channel is full, the method will return an error. If
+    /// the channel was disconnected, the method will remove the faulty
+    /// channel and return an error.
+    pub fn try_send(&self, name: &str, msg: T) -> Result<(), Error> {
+        let tx = self.get(name).ok_or(Error::Nonexistent)?;
+        match tx.try_send(msg) {
+            Err(TrySendError::Full(_)) => Err(Error::Full),
+            Err(TrySendError::Disconnected(_)) => {
+                self.remove(name);
+                Err(Error::Disconnected)
+            },
+            Ok(()) => Ok(())
+        }
     }
 
     #[must_use]
@@ -137,7 +193,7 @@ mod tests {
     #[test]
     fn send_channel() {
         let channelmap = ChannelMap::new();
-        let receiver = channelmap.add("foo");
+        let receiver = channelmap.add("foo").unwrap();
         assert!(channelmap.contains("foo"));
         channelmap.send("foo", "bar").unwrap();
         assert_eq!(receiver.recv(), Ok("bar"));
@@ -146,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn send_channel_async() {
         let channelmap = ChannelMap::new();
-        let receiver = channelmap.add("foo");
+        let receiver = channelmap.add("foo").unwrap();
         channelmap.send_async("foo", "bar").await.unwrap();
         assert_eq!(receiver.recv_async().await, Ok("bar"));
     }
@@ -154,7 +210,7 @@ mod tests {
     #[test]
     fn remove_channel() {
         let channelmap: ChannelMap<&str> = ChannelMap::new();
-        let _receiver = channelmap.add("foo");
+        let _receiver = channelmap.add("foo").unwrap();
         channelmap.remove("foo");
         assert_eq!(channelmap.send("foo", "bar"), Err(Error::Nonexistent));
     }
@@ -163,7 +219,7 @@ mod tests {
     fn send_channel_threads() {
         let channelmap = ChannelMap::new();
         let channelmap_clone = channelmap.clone();
-        let receiver: Receiver<&str> = channelmap_clone.add("foo");
+        let receiver: Receiver<&str> = channelmap_clone.add("foo").unwrap();
         let thread = std::thread::spawn(move || {
             assert_eq!(receiver.recv(), Ok("bar"));
         });
@@ -175,13 +231,28 @@ mod tests {
 
     #[test]
     fn test_length() {
-        let channelmap = ChannelMap::new();
+        let channelmap: ChannelMap<&str> = ChannelMap::new();
         assert!(channelmap.is_empty());
-        let _receiver = channelmap.add("foo");
-        channelmap.send("foo", "bar").unwrap();
+        let _receiver = channelmap.add("foo").unwrap();
         assert_eq!(channelmap.len(), 1);
         channelmap.remove("foo");
         assert!(channelmap.is_empty());
         assert_eq!(channelmap.len(), 0);
+    }
+
+    #[test]
+    fn already_exists() {
+        let channelmap: ChannelMap<&str> = ChannelMap::new();
+        let _receiver = channelmap.add("foo").unwrap();
+        assert_eq!(channelmap.add("foo").unwrap_err(), Error::AlreadyExists("foo".to_owned()));
+    }
+
+    #[test]
+    fn dropped_rx() {
+        let channelmap = ChannelMap::new();
+        {
+            let _receiver = channelmap.add("foo").unwrap();
+        }
+        assert_eq!(channelmap.send("foo", "bar").unwrap_err(), Error::Disconnected);
     }
 }
